@@ -101,8 +101,8 @@ async function tryRSSFeeds() {
 
 /**
  * Strategy 2: Scrape the Pitchfork reviews listing page directly.
- * The listing page typically shows recent reviews with artist/album/score
- * even if full review text is paywalled.
+ * Extracts reviews from window.__PRELOADED_STATE__ embedded JSON, which contains
+ * artist (subHed.name), album (dangerousHed), score (ratingValue.score), pubDate, and url.
  */
 async function tryPitchforkListingPage() {
   try {
@@ -114,67 +114,71 @@ async function tryPitchforkListingPage() {
     }
 
     const html = await res.text();
-    const $ = cheerio.load(html);
-    const reviews = [];
 
-    // Pitchfork uses various markup patterns. Try multiple selectors.
-    // Look for JSON data embedded in the page (common in modern Pitchfork/Condé Nast)
-    const scripts = $('script');
-    for (let i = 0; i < scripts.length; i++) {
-      const content = $(scripts[i]).html() || '';
-      
-      // Look for __PRELOADED_STATE__ or similar data blobs
-      if (content.includes('reviewScore') || content.includes('rating') || content.includes('albums')) {
-        try {
-          // Try to extract JSON from various patterns
-          const jsonMatch = content.match(/window\.__\w+__\s*=\s*({.+});?$/m)
-            || content.match(/({.+\"reviewScore\".+})/);
-          if (jsonMatch) {
-            const data = JSON.parse(jsonMatch[1]);
-            // Try to extract reviews from the data structure
-            const extractedReviews = extractReviewsFromJSON(data);
-            if (extractedReviews.length > 0) {
-              console.log(`    → ✓ Found ${extractedReviews.length} reviews from embedded JSON`);
-              return extractedReviews;
-            }
+    // Extract window.__PRELOADED_STATE__ JSON blob
+    const marker = 'window.__PRELOADED_STATE__ = ';
+    const markerIdx = html.indexOf(marker);
+    if (markerIdx !== -1) {
+      try {
+        const jsonStart = markerIdx + marker.length;
+        const scriptEnd = html.indexOf('</script>', jsonStart);
+        const jsonStr = html.substring(jsonStart, scriptEnd).trim().replace(/;$/, '');
+        const data = JSON.parse(jsonStr);
+
+        // Navigate the JSON tree to find arrays of review items (they have subHed.name = artist)
+        const items = findReviewItems(data);
+        if (items.length > 0) {
+          const reviews = items.map(item => {
+            const artist = item.subHed?.name || '';
+            // dangerousHed is the album title wrapped in <em> tags — strip HTML
+            const album = (item.dangerousHed || '').replace(/<[^>]+>/g, '').trim();
+            const url = item.url || '';
+            const link = url.startsWith('http') ? url : `https://pitchfork.com${url}`;
+            const score = item.ratingValue?.score ?? null;
+            const pubDate = item.pubDate ? new Date(item.pubDate) : new Date();
+            return {
+              artist,
+              album,
+              link,
+              pubDate,
+              score: typeof score === 'number' ? score : null,
+              rawTitle: `${artist}: ${album}`,
+            };
+          }).filter(r => r.artist || r.album);
+
+          if (reviews.length > 0) {
+            console.log(`    → ✓ Found ${reviews.length} reviews from __PRELOADED_STATE__`);
+            return reviews;
           }
-        } catch { /* continue trying other scripts */ }
+        }
+      } catch (e) {
+        console.log(`    → JSON parse error: ${e.message}`);
       }
     }
 
-    // Fallback: parse HTML review cards
-    // Pitchfork review listings typically have cards with artist, album, score
-    const reviewSelectors = [
-      '.review', '[class*="review-collection"] [class*="review"]',
-      '[data-testid="review"]', '.summary-item', '.review-collection .review',
-      'article', '.review-list__item',
-    ];
+    // Fallback: parse HTML summary-item cards
+    const $ = cheerio.load(html);
+    const reviews = [];
 
-    for (const selector of reviewSelectors) {
-      $(selector).each((_, el) => {
-        const $el = $(el);
-        
-        // Try various artist/album/score selectors
-        const artist = $el.find('[class*="artist"], .artist-list, h3').first().text().trim();
-        const album = $el.find('[class*="title"]:not([class*="artist"]), h2, .work-title').first().text().trim();
-        const link = $el.find('a').first().attr('href') || '';
-        const scoreText = $el.find('[class*="score"], [class*="rating"]').first().text().trim();
-        const score = parseFloat(scoreText);
-        
-        if (artist || album) {
-          reviews.push({
-            artist: artist || 'Unknown',
-            album: album || 'Unknown',
-            link: link.startsWith('http') ? link : `https://pitchfork.com${link}`,
-            pubDate: new Date(), // listing page doesn't always show dates
-            score: !isNaN(score) ? score : null,
-            rawTitle: `${artist}: ${album}`,
-          });
-        }
-      });
+    $('.summary-item, [class*="SummaryItemWrapper"]').each((_, el) => {
+      const $el = $(el);
+      const artist = $el.find('.summary-item__sub-hed, [class*="SubHed"]').first().text().trim();
+      const album = $el.find('.summary-item__hed, [class*="SummaryItemHed"]').first().text().trim();
+      const link = $el.find('a[href*="/reviews/albums/"]').first().attr('href') || '';
+      const scoreText = $el.find('[class*="RatingsSingle"], [class*="score"]').first().text().trim();
+      const score = parseFloat(scoreText);
 
-      if (reviews.length > 0) break;
-    }
+      if (artist || album) {
+        reviews.push({
+          artist: artist || 'Unknown',
+          album: album || 'Unknown',
+          link: link.startsWith('http') ? link : `https://pitchfork.com${link}`,
+          pubDate: new Date(),
+          score: !isNaN(score) ? score : null,
+          rawTitle: `${artist}: ${album}`,
+        });
+      }
+    });
 
     if (reviews.length > 0) {
       console.log(`    → ✓ Found ${reviews.length} reviews from HTML`);
@@ -190,44 +194,26 @@ async function tryPitchforkListingPage() {
 }
 
 /**
- * Helper: recursively search a JSON structure for review data.
+ * Recursively find arrays of review items inside the __PRELOADED_STATE__ JSON.
+ * Review item arrays are identified by items having a subHed.name field (artist name).
  */
-function extractReviewsFromJSON(data, reviews = []) {
-  if (!data || typeof data !== 'object') return reviews;
-  
-  // Look for arrays that look like review collections
-  if (Array.isArray(data)) {
-    for (const item of data) {
-      if (item && typeof item === 'object' && (item.reviewScore || item.rating || item.score)) {
-        const artist = item.artist || item.artists?.[0]?.name || item.artistName || '';
-        const album = item.album || item.title || item.albumTitle || '';
-        const score = item.reviewScore || item.rating || item.score;
-        const link = item.url || item.link || item.slug || '';
-        const pubDate = item.pubDate || item.publishDate || item.date || '';
-
-        if (artist || album) {
-          reviews.push({
-            artist,
-            album,
-            link: link.startsWith('http') ? link : `https://pitchfork.com${link}`,
-            pubDate: pubDate ? new Date(pubDate) : new Date(),
-            score: typeof score === 'number' ? score : parseFloat(score) || null,
-            rawTitle: `${artist}: ${album}`,
-          });
-        }
-      } else {
-        extractReviewsFromJSON(item, reviews);
-      }
+function findReviewItems(obj, depth = 0) {
+  if (depth > 6 || !obj || typeof obj !== 'object') return [];
+  if (Array.isArray(obj)) {
+    if (obj.length > 0 && obj[0] && typeof obj[0].subHed === 'object' && obj[0].subHed?.name) {
+      return obj;
+    }
+    for (const v of obj) {
+      const result = findReviewItems(v, depth + 1);
+      if (result.length > 0) return result;
     }
   } else {
-    for (const value of Object.values(data)) {
-      if (typeof value === 'object') {
-        extractReviewsFromJSON(value, reviews);
-      }
+    for (const v of Object.values(obj)) {
+      const result = findReviewItems(v, depth + 1);
+      if (result.length > 0) return result;
     }
   }
-
-  return reviews;
+  return [];
 }
 
 /**
@@ -371,12 +357,12 @@ export async function getReviewsForDates(dates) {
   console.log(`Looking for reviews published on: ${dateStrings.join(', ')}`);
   console.log(`\nTrying data sources...`);
 
-  // Source 1: RSS feeds
-  let allReviews = await tryRSSFeeds();
+  // Source 1: Pitchfork listing page (most accurate — artist names, scores, dates from __PRELOADED_STATE__)
+  let allReviews = await tryPitchforkListingPage();
 
-  // Source 2: Pitchfork listing page
+  // Source 2: RSS feeds (fallback — title parsing may lose artist/album separation)
   if (!allReviews) {
-    allReviews = await tryPitchforkListingPage();
+    allReviews = await tryRSSFeeds();
   }
 
   // Source 3: AOTY
