@@ -100,6 +100,63 @@ async function tryRSSFeeds() {
 }
 
 /**
+ * Map a raw review item from __PRELOADED_STATE__ into our normalized shape.
+ * Review items expose artist (subHed.name), album (dangerousHed, HTML-wrapped),
+ * score (ratingValue.score), pubDate, and url.
+ */
+function mapReviewItem(item) {
+  const artist = item.subHed?.name || '';
+  // dangerousHed is the album title wrapped in <em> tags — strip HTML
+  const album = (item.dangerousHed || '').replace(/<[^>]+>/g, '').trim();
+  const url = item.url || '';
+  const link = url.startsWith('http') ? url : `https://pitchfork.com${url}`;
+  // score may arrive as a number or a string like "8.0"
+  const rawScore = item.ratingValue?.score;
+  const score = rawScore == null ? null : parseFloat(rawScore);
+  const pubDate = item.pubDate ? new Date(item.pubDate) : new Date();
+  return {
+    artist,
+    album,
+    link,
+    pubDate,
+    score: Number.isFinite(score) ? score : null,
+    rawTitle: `${artist}: ${album}`,
+  };
+}
+
+/**
+ * Fetch and parse a single page of the Pitchfork album-reviews listing.
+ * Page 1 is the base URL; later pages use ?page=N. Returns an array of
+ * normalized reviews (parsed from window.__PRELOADED_STATE__), or null if the
+ * page could not be fetched/parsed. An empty array means "fetched, no reviews".
+ */
+export async function fetchListingPageReviews(page = 1) {
+  const url = page > 1 ? `${PITCHFORK_REVIEWS_URL}?page=${page}` : PITCHFORK_REVIEWS_URL;
+  const res = await fetch(url, { headers: HEADERS, redirect: 'follow' });
+  if (!res.ok) {
+    console.log(`    → page ${page}: ${res.status}`);
+    return null;
+  }
+
+  const html = await res.text();
+  const marker = 'window.__PRELOADED_STATE__ = ';
+  const markerIdx = html.indexOf(marker);
+  if (markerIdx === -1) return null;
+
+  try {
+    const jsonStart = markerIdx + marker.length;
+    const scriptEnd = html.indexOf('</script>', jsonStart);
+    const jsonStr = html.substring(jsonStart, scriptEnd).trim().replace(/;$/, '');
+    const data = JSON.parse(jsonStr);
+    const items = findReviewItems(data);
+    return items.map(mapReviewItem).filter(r => r.artist || r.album);
+  } catch (e) {
+    console.log(`    → page ${page} JSON parse error: ${e.message}`);
+    return null;
+  }
+}
+
+/**
  * Strategy 2: Scrape the Pitchfork reviews listing page directly.
  * Extracts reviews from window.__PRELOADED_STATE__ embedded JSON, which contains
  * artist (subHed.name), album (dangerousHed), score (ratingValue.score), pubDate, and url.
@@ -107,58 +164,23 @@ async function tryRSSFeeds() {
 async function tryPitchforkListingPage() {
   try {
     console.log(`  Trying Pitchfork listing page: ${PITCHFORK_REVIEWS_URL}`);
+
+    // Primary path: parse __PRELOADED_STATE__ from page 1
+    const reviews = await fetchListingPageReviews(1);
+    if (reviews && reviews.length > 0) {
+      console.log(`    → ✓ Found ${reviews.length} reviews from __PRELOADED_STATE__`);
+      return reviews;
+    }
+
+    // Fallback: parse HTML summary-item cards
     const res = await fetch(PITCHFORK_REVIEWS_URL, { headers: HEADERS, redirect: 'follow' });
     if (!res.ok) {
       console.log(`    → ${res.status}`);
       return null;
     }
-
     const html = await res.text();
-
-    // Extract window.__PRELOADED_STATE__ JSON blob
-    const marker = 'window.__PRELOADED_STATE__ = ';
-    const markerIdx = html.indexOf(marker);
-    if (markerIdx !== -1) {
-      try {
-        const jsonStart = markerIdx + marker.length;
-        const scriptEnd = html.indexOf('</script>', jsonStart);
-        const jsonStr = html.substring(jsonStart, scriptEnd).trim().replace(/;$/, '');
-        const data = JSON.parse(jsonStr);
-
-        // Navigate the JSON tree to find arrays of review items (they have subHed.name = artist)
-        const items = findReviewItems(data);
-        if (items.length > 0) {
-          const reviews = items.map(item => {
-            const artist = item.subHed?.name || '';
-            // dangerousHed is the album title wrapped in <em> tags — strip HTML
-            const album = (item.dangerousHed || '').replace(/<[^>]+>/g, '').trim();
-            const url = item.url || '';
-            const link = url.startsWith('http') ? url : `https://pitchfork.com${url}`;
-            const score = item.ratingValue?.score ?? null;
-            const pubDate = item.pubDate ? new Date(item.pubDate) : new Date();
-            return {
-              artist,
-              album,
-              link,
-              pubDate,
-              score: typeof score === 'number' ? score : null,
-              rawTitle: `${artist}: ${album}`,
-            };
-          }).filter(r => r.artist || r.album);
-
-          if (reviews.length > 0) {
-            console.log(`    → ✓ Found ${reviews.length} reviews from __PRELOADED_STATE__`);
-            return reviews;
-          }
-        }
-      } catch (e) {
-        console.log(`    → JSON parse error: ${e.message}`);
-      }
-    }
-
-    // Fallback: parse HTML summary-item cards
     const $ = cheerio.load(html);
-    const reviews = [];
+    const htmlReviews = [];
 
     $('.summary-item, [class*="SummaryItemWrapper"]').each((_, el) => {
       const $el = $(el);
@@ -169,7 +191,7 @@ async function tryPitchforkListingPage() {
       const score = parseFloat(scoreText);
 
       if (artist || album) {
-        reviews.push({
+        htmlReviews.push({
           artist: artist || 'Unknown',
           album: album || 'Unknown',
           link: link.startsWith('http') ? link : `https://pitchfork.com${link}`,
@@ -180,9 +202,9 @@ async function tryPitchforkListingPage() {
       }
     });
 
-    if (reviews.length > 0) {
-      console.log(`    → ✓ Found ${reviews.length} reviews from HTML`);
-      return reviews;
+    if (htmlReviews.length > 0) {
+      console.log(`    → ✓ Found ${htmlReviews.length} reviews from HTML`);
+      return htmlReviews;
     }
 
     console.log(`    → No reviews found in HTML`);

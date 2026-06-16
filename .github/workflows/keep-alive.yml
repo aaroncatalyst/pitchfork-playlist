@@ -1,0 +1,30 @@
+name: Keep Alive
+
+# GitHub disables scheduled workflows after 60 days of repository inactivity.
+# This job pushes an empty commit on the 1st of every month so the daily
+# playlist workflow never gets auto-disabled.
+
+on:
+  schedule:
+    # 06:00 UTC on the 1st of every month
+    - cron: '0 6 1 * *'
+  # Allow manual runs from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Push empty keep-alive commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keep-alive"
+          git push
